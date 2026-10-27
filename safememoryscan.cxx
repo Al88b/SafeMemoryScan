@@ -2,18 +2,21 @@
 // lowest address to highest, then wraps round and starts again.
 //
 // Build:  g++ -O2 -std=c++17 -o safememoryscan safememoryscan.cxx
-// Run:    ./safememoryscan            (Ctrl+C to stop)
+// Run:    ./safememoryscan            (Space = pause/resume, Ctrl+C to stop)
 //         ./safememoryscan | less     (to page through it)
 
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <poll.h>
 #include <sys/uio.h>
+#include <termios.h>
 #include <unistd.h>
 
 struct MemoryRange {
@@ -25,6 +28,54 @@ struct MemoryRange {
 
 static volatile sig_atomic_t g_running = 1;
 static void onSignal(int) { g_running = 0; }
+
+// ---- Keyboard control: Space pauses/resumes output ----------------------
+
+static termios g_savedTerm;
+static bool g_keyboard = false;   // true once the terminal is in key-at-a-time mode
+
+static void restoreTerminal() {
+    if (g_keyboard) tcsetattr(STDIN_FILENO, TCSANOW, &g_savedTerm);
+}
+
+// Switch the terminal so single key presses arrive immediately, without
+// waiting for Enter and without being echoed. Ctrl+C still works (ISIG kept).
+// Only done when both stdin and stdout are the terminal: if the output is
+// piped (e.g. into less), that program owns the keyboard instead.
+static void enableKeyboard() {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &g_savedTerm) != 0) return;
+    termios raw = g_savedTerm;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        g_keyboard = true;
+        std::atexit(restoreTerminal);
+    }
+}
+
+// Returns the next key pressed, or -1 if none arrives within timeoutMs.
+static int readKey(int timeoutMs) {
+    pollfd pfd{STDIN_FILENO, POLLIN, 0};
+    if (poll(&pfd, 1, timeoutMs) <= 0) return -1;
+    unsigned char c;
+    return read(STDIN_FILENO, &c, 1) == 1 ? c : -1;
+}
+
+// Call regularly from the scan loop. If Space was pressed, stop here until
+// Space is pressed again (or Ctrl+C).
+static void checkPause() {
+    if (!g_keyboard || readKey(0) != ' ') return;
+    std::fflush(stdout);
+    std::fprintf(stderr, "\n[paused - press Space to resume]\n");
+    while (g_running) {
+        if (readKey(100) == ' ') {
+            std::fprintf(stderr, "[resumed]\n");
+            return;
+        }
+    }
+}
 
 // Parse /proc/self/maps for readable regions. Re-read on every pass,
 // because the map changes as the program runs (heap growth, etc.).
@@ -75,6 +126,7 @@ int main() {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGPIPE, onSignal);   // e.g. piped into `head` and it exits
+    enableKeyboard();
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     std::vector<uint8_t> buf(page);
 
@@ -90,6 +142,7 @@ int main() {
 
             // Walk the region one page at a time, lowest to highest.
             for (uintptr_t addr = r.start; addr < r.end && g_running; addr += page) {
+                checkPause();
                 size_t len = std::min<size_t>(page, r.end - addr);
                 ssize_t got = safeRead(addr, buf.data(), len);
                 if (got <= 0) {
