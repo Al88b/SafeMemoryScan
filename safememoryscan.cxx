@@ -5,6 +5,7 @@
 // Run:    ./safememoryscan            (Space = pause/resume, Ctrl+C to stop)
 //         ./safememoryscan | less     (to page through it)
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <termios.h>
 #include <unistd.h>
@@ -122,11 +124,51 @@ static void printLine(uintptr_t addr, const uint8_t* b, size_t n) {
     std::fwrite(out, 1, p, stdout);
 }
 
+// ---- Terminal width: make the window wide enough for every line ---------
+
+// A hex dump line: 16-digit address, 2 spaces, 16 x "xx ", " |", 16 chars, "|"
+static const int kHexLineCols = 16 + 2 + 16 * 3 + 2 + 16 + 1;   // 85
+static const int kMaxCols = 200;   // don't ask for an absurdly wide window
+
+static bool getTermSize(int& rows, int& cols) {
+    winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0) return false;
+    rows = ws.ws_row > 0 ? ws.ws_row : 40;
+    cols = ws.ws_col;
+    return true;
+}
+
+// Width of the "--- 0x... - 0x... [perms] name ---" header for a region.
+static int headerCols(const MemoryRange& r) {
+    return std::snprintf(nullptr, 0, "--- 0x%lx - 0x%lx [%s] %s ---",
+                         static_cast<unsigned long>(r.start), static_cast<unsigned long>(r.end),
+                         r.permissions.c_str(), r.name.c_str());
+}
+
+// If the terminal is too narrow, ask it to resize (xterm "CSI 8 ; rows ; cols t").
+// Terminals that ignore the request get a note instead.
+static void ensureTerminalWidth(const std::vector<MemoryRange>& regions) {
+    if (!isatty(STDOUT_FILENO)) return;   // piped into less etc.: nothing to resize
+    int needed = kHexLineCols;
+    for (const auto& r : regions) needed = std::max(needed, headerCols(r));
+    needed = std::min(needed, kMaxCols);
+
+    int rows, cols;
+    if (!getTermSize(rows, cols) || cols >= needed) return;
+    std::printf("\033[8;%d;%dt", rows, needed);
+    std::fflush(stdout);
+    usleep(200 * 1000);   // give the window a moment to resize
+    if (getTermSize(rows, cols) && cols < needed)
+        std::fprintf(stderr, "Note: terminal is %d columns wide; widen it to at least %d "
+                             "to avoid wrapped lines.\n", cols, needed);
+}
+
 int main() {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGPIPE, onSignal);   // e.g. piped into `head` and it exits
     enableKeyboard();
+    ensureTerminalWidth(getReadableRegions());
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     std::vector<uint8_t> buf(page);
 
